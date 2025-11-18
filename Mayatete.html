@@ -1,0 +1,694 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Mayatete (Chromakey)</title>
+    
+    <!-- Tailwind CSSの読み込み --><script src="https://cdn.tailwindcss.com"></script>
+    <!-- Three.jsの読み込み --><script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <!-- MediaPipe Handsの読み込み --><script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1675469240/hands.js"></script>
+    <!-- MediaPipe CameraUtils --><script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils@0.3/camera_utils.js"></script>
+    
+    <style>
+        body { 
+            font-family: 'Inter', sans-serif; 
+            background-color: #f7fafc; 
+            margin: 0; 
+            overflow: hidden;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+        }
+        #threeDContainer {
+            width: 100vw;
+            height: 100vh;
+        }
+        #threeDCanvas {
+            display: block;
+            width: 100%;
+            height: 100%;
+        }
+    </style>
+</head>
+<body>
+
+    <!-- 3Dモデルを表示するためのコンテナのみ --><div id="threeDContainer">
+        <canvas id="threeDCanvas"></canvas>
+    </div>
+
+    <!-- メッセージボックス --><div id="messageBox" class="rounded-lg shadow-lg" style="position:fixed; top:10px; left:50%; transform:translateX(-50%); z-index:10; padding: 10px; background: rgba(255, 255, 255, 0.9); border-radius: 8px; box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);">
+        カメラの起動を待っています...
+    </div>
+
+    <script>
+        // MediaPipe Handsのランドマーク接続定義 (メッシュ用)
+        const BONE_CONNECTIONS = [
+            // Fingers
+            [0, 1], [1, 2], [2, 3], [3, 4],
+            [5, 6], [6, 7], [7, 8],
+            [9, 10], [10, 11], [11, 12],
+            [13, 14], [14, 15], [15, 16],
+            [17, 18], [18, 19], [19, 20],
+            
+            // Metacarpals
+            [0, 5], [0, 9], [0, 13], [0, 17],
+            [5, 9], [9, 13], [13, 17]
+        ];
+        
+        // Thumb landmarks
+        const THUMB_LANDMARKS = [0, 1, 2, 3, 4];
+        
+        // 指先のランドマークID
+        const TIP_LANDMARKS = [4, 8, 12, 16, 20];
+        // 指の付け根（手のひらに接する部分）のランドマークID
+        const BASE_JOINT_LANDMARKS = [1, 5, 9, 13, 17]; 
+
+        // 共通の太さ調整定数
+        const JOINT_RADIUS_FACTOR = 0.8; // 他の関節の基本倍率
+        const TIP_RADIUS_FACTOR = 0.8;   // <<< 指先の太さを 0.8 にブースト >>>
+        
+        // --- UI elements ---
+        const messageBox = document.getElementById('messageBox');
+        
+        // --- Three.js Setup ---
+        let scene, camera, renderer;
+        const handMeshes = []; 
+
+        // 肌の色 (指定された色)
+        const flatColor = 0xFFEEE2; 
+        // 線の色を変更 (指定された色)
+        const outlineColor = 0x5A4F47; 
+
+        // 1. メインのソリッドボディ用マテリアル (指、関節、手首用)
+        const flatMaterial = new THREE.MeshBasicMaterial({ 
+            color: flatColor,
+            side: THREE.DoubleSide,
+            polygonOffset: true,
+            polygonOffsetFactor: -10.0, // 通常のオフセット (手前)
+            polygonOffsetUnits: -10.0
+        }); 
+
+        // 1b. 手のひら専用マテリアル (Z-fighting対策を超強化)
+        const flatPalmMaterial = new THREE.MeshBasicMaterial({
+            color: flatColor,
+            side: THREE.DoubleSide,
+            polygonOffset: true,
+            polygonOffsetFactor: -50.0, // 値を大幅に強化 (より手前に)
+            polygonOffsetUnits: -50.0  // 値を大幅に強化
+        });
+
+        // 2. シルエットアウトライン用マテリアル (指定された色、裏面のみ描画)
+        const blackOutlineMaterial = new THREE.MeshBasicMaterial({ 
+            color: outlineColor, // ここで変更
+            side: THREE.BackSide, // 裏面描画のみ
+            polygonOffset: true,
+            polygonOffsetFactor: 5.0, // 5.0 に設定 (本体に近づける)
+            polygonOffsetUnits: 5.0
+        });
+        
+        // Mesh resolution (segments)
+        const MESH_SEGMENTS = 32; 
+
+        // Scaling factor for MediaPipe coordinates in 3D space
+        const worldScale = 10; 
+        
+        // Smoothing settings
+        const smoothingFactor = 0.4; 
+        
+        // Thickness ratios
+        const FINGER_THICKNESS_RATIO = 0.40; 
+        
+        // 手首の太さの倍率
+        const WRIST_THICKNESS_RATIO = 1.2;  // 腕の遠い側の太さのベース
+        const L0_EMPHASIS_FACTOR = 2.5;     // 手首の球体の太さ
+        
+        const EXTRA_DOT_THICKNESS_RATIO = 0.30; // Thickness of the extra wrist dot
+        
+        // アウトラインの細さ調整
+        const OUTLINE_SCALE_FACTOR = 1.07; // アウトラインの太さ (基本倍率: 骨、指先、指の付け根に適用)
+        const L0_OUTLINE_THICKNESS_SCALE = 1.03; // L0 (手首の球体) 専用の細いアウトライン倍率
+        const PALM_OUTLINE_SCALE = 1.03; // 手のひらメッシュ専用の細いアウトライン倍率
+
+        // 指の関節だけを太くするブースト係数 (L0, 指先, 指の付け根以外に適用)
+        const JOINT_OUTLINE_BOOST = 1.05; 
+
+        const wristOffsetX = 0.1; // X-axis offset for the wrist cylinder
+        
+        // [腕シリンダーの長さ設定]
+        const wristLengthFactor = 0.9; // ピンクのシリンダーの長さ (長い)
+        const outlineWristLengthFactor = 0.60; // 黒いアウトライン用シリンダーの長さ 
+
+        // [黒いシリンダーのオフセット設定]
+        const outlineWristStartOffsetFactor = 0.08; 
+        
+        // 腕の遠い側のアウトラインを細くするテーパー係数
+        const OUTLINE_TAPER_FACTOR = 0.85; 
+
+        /**
+         * Creates all meshes and objects for a single hand.
+         * @returns {object} Hand mesh, line, and state objects
+         */
+        function createHandMeshes() {
+            const hand = {
+                // メインボディ
+                spheres: [],         
+                cylinders: [],       
+                wristCylinder: null, 
+                palmMesh: null,      
+                extraWristDot: null, // 肌色の点
+                
+                // アウトライン用メッシュ
+                outlineSpheres: [],
+                outlineCylinders: [],
+                outlineWristCylinder: null,
+                outlinePalmMesh: null,
+
+                smoothedLandmarks: [],
+                isVisible: false
+            };
+
+            // === Mesh elements creation ===
+            const sphereGeometry = new THREE.SphereGeometry(1.0, MESH_SEGMENTS, MESH_SEGMENTS); 
+            // 初期ジオメトリ（ダミー）
+            const cylinderGeometry = new THREE.CylinderGeometry(1.0, 1.0, 1, MESH_SEGMENTS); 
+            
+            // 1. Create all joint spheres (21 points)
+            for (let i = 0; i < 21; i++) {
+                // メイン (flatMaterial を使用)
+                const sphere = new THREE.Mesh(sphereGeometry, flatMaterial); 
+                sphere.visible = false; 
+                sphere.renderOrder = 1; // メインを後に描画
+                scene.add(sphere);
+                hand.spheres.push(sphere);
+                
+                // アウトライン (黒)
+                const outlineSphere = new THREE.Mesh(sphereGeometry, blackOutlineMaterial); 
+                outlineSphere.visible = false; 
+                outlineSphere.renderOrder = 0; // アウトラインを先に描画
+                scene.add(outlineSphere);
+                hand.outlineSpheres.push(outlineSphere);
+            }
+
+            // 2. Create the extra wrist dot (メインのみ, flatMaterial を使用)
+            hand.extraWristDot = new THREE.Mesh(sphereGeometry, flatMaterial); 
+            hand.extraWristDot.visible = false;
+            hand.extraWristDot.renderOrder = 1; // メインを後に描画
+            scene.add(hand.extraWristDot);
+
+            // 3. Create all bone cylinders (BONE_CONNECTIONS count)
+            BONE_CONNECTIONS.forEach(() => {
+                // メイン (flatMaterial を使用)
+                const cylinder = new THREE.Mesh(cylinderGeometry, flatMaterial); 
+                cylinder.visible = false; 
+                cylinder.renderOrder = 1; // メインを後に描画
+                scene.add(cylinder);
+                hand.cylinders.push(cylinder);
+
+                // アウトライン (黒)
+                const outlineCylinder = new THREE.Mesh(cylinderGeometry, blackOutlineMaterial); 
+                outlineCylinder.visible = false; 
+                outlineCylinder.renderOrder = 0; // アウトラインを先に描画
+                scene.add(outlineCylinder);
+                hand.outlineCylinders.push(outlineCylinder);
+            });
+
+            // 4. Initialize wrist cylinder
+            // 腕シリンダーは onResults でジオメトリを動的に更新するため、ここでは初期ジオメトリを使用
+            const initialWristGeometry = new THREE.CylinderGeometry(1.0, 1.0, 1, MESH_SEGMENTS);
+            
+            // メイン (flatMaterial を使用)
+            hand.wristCylinder = new THREE.Mesh(initialWristGeometry.clone(), flatMaterial);
+            hand.wristCylinder.visible = false;
+            hand.wristCylinder.renderOrder = 1; // メインを後に描画
+            scene.add(hand.wristCylinder);
+            
+            // アウトライン (黒)
+            hand.outlineWristCylinder = new THREE.Mesh(initialWristGeometry.clone(), blackOutlineMaterial);
+            hand.outlineWristCylinder.visible = false;
+            hand.outlineWristCylinder.renderOrder = 0; // アウトラインを先に描画
+            scene.add(hand.outlineWristCylinder);
+            
+            // 5. Initialize palm mesh (custom geometry)
+            const initialPalmGeometry = new THREE.BufferGeometry();
+            // 手のひら専用マテリアル(flatPalmMaterial)を割り当て
+            hand.palmMesh = new THREE.Mesh(initialPalmGeometry, flatPalmMaterial);
+            hand.palmMesh.visible = false;
+            hand.palmMesh.renderOrder = 1; // メインを後に描画 (他のピンク部分と同じ)
+            scene.add(hand.palmMesh);
+            
+            // アウトライン (黒)
+            hand.outlinePalmMesh = new THREE.Mesh(initialPalmGeometry, blackOutlineMaterial);
+            hand.outlinePalmMesh.visible = false;
+            hand.outlinePalmMesh.renderOrder = 0; // アウトラインを先に描画
+            hand.outlinePalmMesh.scale.setScalar(PALM_OUTLINE_SCALE); 
+            scene.add(hand.outlinePalmMesh);
+
+
+            // Initialize smoothing array
+            for(let i=0; i<21; i++) {
+                hand.smoothedLandmarks.push(null);
+            }
+
+            return hand;
+        }
+
+        function initThreeJS() {
+            scene = new THREE.Scene();
+
+            // Background color set to pure green for chromakey
+            scene.background = new THREE.Color(0x00ff00); 
+
+            // Camera setup (Orthographic for 2D/stylized look)
+            const aspect = window.innerWidth / window.innerHeight;
+            const size = 15; 
+            camera = new THREE.OrthographicCamera(
+                -size * aspect / 2, size * aspect / 2, 
+                size / 2, -size / 2, 
+                0.1, 1000
+            );
+            camera.position.z = 10;
+            camera.position.y = 5;
+            camera.lookAt(0, 0, 0);
+
+            renderer = new THREE.WebGLRenderer({ antialias: true, canvas: document.getElementById('threeDCanvas') });
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.setPixelRatio(window.devicePixelRatio);
+            
+            // renderOrder を有効にする
+            renderer.sortObjects = true; 
+
+            handMeshes.push(createHandMeshes());
+            handMeshes.push(createHandMeshes());
+        }
+
+        function resizeRenderer() {
+            const width = window.innerWidth;
+            const height = window.innerHeight;
+            
+            renderer.setSize(width, height);
+            
+            const aspect = width / height;
+            const size = 15;
+            camera.left = -size * aspect / 2;
+            camera.right = size * aspect / 2;
+            camera.top = size / 2;
+            camera.bottom = -size / 2;
+            camera.updateProjectionMatrix();
+        }
+
+        window.addEventListener('resize', resizeRenderer);
+        initThreeJS();
+        
+        // --- MediaPipe Hands Setup ---
+        const hands = new Hands({locateFile: (file) => {
+            return `https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4/${file}`;
+        }});
+
+        hands.setOptions({
+            maxNumHands: 2, 
+            modelComplexity: 1,
+            minDetectionConfidence: 0.5,
+            minTrackingConfidence: 0.5
+        });
+
+        hands.onResults(onResults);
+
+        // --- Camera Setup ---
+        async function setupCamera() {
+            try {
+                const stream = await navigator.mediaDevices.getUserMedia({ video: { width: 640, height: 480 } });
+                
+                const videoElement = document.createElement('video');
+                videoElement.srcObject = stream;
+                videoElement.play(); 
+
+                await new Promise((resolve) => {
+                    videoElement.onloadeddata = resolve;
+                });
+
+                messageBox.innerHTML = '✨ トラッキング中...手をカメラにかざしてください。';
+                messageBox.style.backgroundColor = 'rgba(191, 219, 254, 0.9)';
+                messageBox.style.color = '#1e40af';
+                
+                const camera = new Camera(videoElement, {
+                    onFrame: async () => {
+                        await hands.send({image: videoElement});
+                    },
+                    width: videoElement.videoWidth,
+                    height: videoElement.videoHeight
+                });
+                camera.start();
+
+            } catch (error) {
+                console.error("Webカメラへのアクセスに失敗しました。", error);
+                messageBox.innerHTML = '🚨 エラー: カメラアクセスに失敗しました。権限を確認してください。';
+                messageBox.style.backgroundColor = 'rgba(254, 202, 202, 0.9)';
+                messageBox.color = '#991b1b';
+            }
+        }
+
+        /**
+         * Processes MediaPipe results and updates the 3D model.
+         * @param {object} results - MediaPipe Hands result object
+         */
+        function onResults(results) {
+            const detectedHandsCount = results.multiHandLandmarks ? results.multiHandLandmarks.length : 0;
+
+            for (let i = 0; i < handMeshes.length; i++) {
+                const hand = handMeshes[i];
+
+                if (i < detectedHandsCount) {
+                    const landmarks = results.multiHandLandmarks[i];
+                    const handednessLabel = results.multiHandedness[i].label;
+                    
+                    // 1. Calculate landmark positions and apply smoothing 
+                    landmarks.forEach((landmark, j) => {
+                        let x = (landmark.x - 0.5) * worldScale * -1; 
+                        const y = (landmark.y - 0.5) * worldScale * -1; 
+                        const z = landmark.z * worldScale * -1; 
+
+                        const currentPos = new THREE.Vector3(x, y, z);
+
+                        if (hand.smoothedLandmarks[j]) {
+                            hand.smoothedLandmarks[j].lerp(currentPos, smoothingFactor);
+                        } else {
+                            hand.smoothedLandmarks[j] = currentPos;
+                        }
+                        landmarks[j].position3D = hand.smoothedLandmarks[j]; 
+                    });
+                    
+                    // --- Dynamic Thickness Calculation ---
+                    const v0 = landmarks[0].position3D; 
+                    const v5 = landmarks[5].position3D;
+                    const v9 = landmarks[9].position3D;
+                    const v17 = landmarks[17].position3D;
+
+                    const metacarpalWidth = v5.distanceTo(v9); 
+
+                    const baseThickness = metacarpalWidth * FINGER_THICKNESS_RATIO;
+                    const wristThickness = metacarpalWidth * WRIST_THICKNESS_RATIO; 
+                    const L0_EMPHASIS_FACTOR = 2.5;     // 手首の球体の太さ
+                    
+                    // --- MISSING DEFINITION FIX: L0_Radius (手首の付け根の球体の半径) の定義を追加 ---
+                    const L0_Radius = baseThickness * L0_EMPHASIS_FACTOR; 
+                    // -------------------------------------------------------------------------
+                    
+                    const extraDotThickness = metacarpalWidth * EXTRA_DOT_THICKNESS_RATIO; 
+                    // -------------------------------------
+
+                    // --- 腕のジオメトリの動的更新（自然な手首の接続のため） ---
+                    
+                    // メインシリンダーの太さ
+                    const topRadius = wristThickness; // 腕の遠い側 (Top): 1.2倍
+                    const bottomRadius = L0_Radius * 0.95; // 手首の付け根側 (Bottom): L0の球体とほぼ同じ太さ
+
+                    // メインシリンダーのジオメトリ更新
+                    // CylinderGeometry(radiusTop, radiusBottom, height, ...)
+                    const newWristGeometry = new THREE.CylinderGeometry(
+                        topRadius, 
+                        bottomRadius, 
+                        1, // 高さ
+                        MESH_SEGMENTS,
+                        1,
+                        false // openEnded
+                    );
+                    
+                    // アウトラインシリンダーの太さ計算
+                    const outlineTopRadius = topRadius * OUTLINE_SCALE_FACTOR * OUTLINE_TAPER_FACTOR; 
+                    const outlineBottomRadius = (bottomRadius * OUTLINE_SCALE_FACTOR); 
+
+                    // アウトラインシリンダーのジオメトリ更新
+                    const newOutlineWristGeometry = new THREE.CylinderGeometry(
+                        outlineTopRadius, 
+                        outlineBottomRadius, 
+                        1, // 高さ
+                        MESH_SEGMENTS,
+                        1,
+                        false // openEnded
+                    );
+
+                    // ジオメトリを更新（新しいものを適用し、古いものをdispose）
+                    if (hand.wristCylinder.geometry) hand.wristCylinder.geometry.dispose();
+                    hand.wristCylinder.geometry = newWristGeometry;
+                    
+                    if (hand.outlineWristCylinder.geometry) hand.outlineWristCylinder.geometry.dispose();
+                    hand.outlineWristCylinder.geometry = newOutlineWristGeometry;
+                    // -----------------------------------------------------
+
+                    
+                    // 2. Update joint spheres (Spheres) position and size
+                    landmarks.forEach((landmark, j) => {
+                        const sphere = hand.spheres[j];
+                        const outlineSphere = hand.outlineSpheres[j];
+                        
+                        sphere.position.copy(landmark.position3D);
+                        outlineSphere.position.copy(landmark.position3D); // アウトラインも同じ位置
+                        
+                        let currentRadius;
+                        let outlineScale;
+
+                        if (j === 0) {
+                            // L0 (手首の付け根)
+                            currentRadius = L0_Radius; // メインボディの半径
+                            outlineScale = L0_OUTLINE_THICKNESS_SCALE; // アウトラインの倍率 (1.03)
+                        } else if (TIP_LANDMARKS.includes(j)) {
+                            // 指先 (4, 8, 12, 16, 20)
+                            currentRadius = baseThickness * TIP_RADIUS_FACTOR; // <<< 修正された 0.8 が適用 >>>
+                            outlineScale = OUTLINE_SCALE_FACTOR; // アウトラインの倍率 (1.07)
+                        } else if (BASE_JOINT_LANDMARKS.includes(j)) { 
+                            // 指の付け根の関節 (L1, L5, L9, L13, L17)
+                            currentRadius = baseThickness * JOINT_RADIUS_FACTOR;
+                            outlineScale = OUTLINE_SCALE_FACTOR; // アウトラインの倍率 (1.07)
+                        } else {
+                            // 指のその他の関節 (L2, L3, L6, L7...)
+                            currentRadius = baseThickness * JOINT_RADIUS_FACTOR;
+                            // 強調したアウトライン (1.1235) を適用
+                            outlineScale = OUTLINE_SCALE_FACTOR * JOINT_OUTLINE_BOOST; 
+                        }
+
+                        // メインボディ
+                        sphere.scale.setScalar(currentRadius);
+                        sphere.visible = true; 
+
+                        // アウトライン (裏面描画と合わせて、太さを強調)
+                        outlineSphere.scale.setScalar(currentRadius * outlineScale);
+                        outlineSphere.visible = true;
+                    });
+                    
+                    // 3. Update bone cylinders (Cylinders) position, rotation, and scale
+                    hand.cylinders.forEach((cylinder, j) => {
+                        const [startIdx, endIdx] = BONE_CONNECTIONS[j];
+                        const startPos = landmarks[startIdx].position3D;
+                        const endPos = landmarks[endIdx].position3D;     
+                        
+                        const outlineCylinder = hand.outlineCylinders[j];
+
+                        if (startPos && endPos) {
+                            const distance = startPos.distanceTo(endPos);
+                            const midPoint = new THREE.Vector3().lerpVectors(startPos, endPos, 0.5);
+
+                            let thickness = baseThickness;
+                            if (THUMB_LANDMARKS.includes(startIdx) || THUMB_LANDMARKS.includes(endIdx)) {
+                                thickness *= 1.1; 
+                            }
+
+                            // メインボディ
+                            cylinder.position.copy(midPoint);
+                            cylinder.scale.set(thickness, distance, thickness); 
+                            cylinder.visible = true; 
+
+                            // アウトライン (骨のアウトラインは標準倍率を維持: 1.07)
+                            outlineCylinder.position.copy(midPoint);
+                            outlineCylinder.scale.set(thickness * OUTLINE_SCALE_FACTOR, distance * OUTLINE_SCALE_FACTOR, thickness * OUTLINE_SCALE_FACTOR); 
+                            outlineCylinder.visible = true;
+                            
+                            const orientation = new THREE.Vector3().subVectors(endPos, startPos).normalize();
+                            const up = new THREE.Vector3(0, 1, 0); 
+                            
+                            cylinder.quaternion.setFromUnitVectors(up, orientation);
+                            outlineCylinder.quaternion.setFromUnitVectors(up, orientation);
+
+                        } else {
+                            cylinder.visible = false; 
+                            outlineCylinder.visible = false;
+                        }
+                    });
+
+                    // 4. Update wrist cylinder (with offset)
+                    const v9_for_wrist_dir = landmarks[9].position3D; 
+
+                    if (v0 && v9_for_wrist_dir) {
+                        const handDirection = new THREE.Vector3().subVectors(v0, v9_for_wrist_dir).normalize();
+                        let xOffsetFactor = 0; 
+                        if (handednessLabel === 'Right') {
+                            xOffsetFactor = 1;
+                        } else if (handednessLabel === 'Left') {
+                            xOffsetFactor = -1;
+                        }
+
+                        // === 1. ピンクのメインシリンダー (長い) ===
+                        const longWristLength = worldScale * wristLengthFactor; // 0.9 (長い)
+                        const longWristEnd = v0.clone().add(handDirection.clone().multiplyScalar(longWristLength));
+                        const longDistance = longWristEnd.distanceTo(v0);
+                        const longMidPoint = new THREE.Vector3().lerpVectors(v0, longWristEnd, 0.5);
+                        longMidPoint.x += wristOffsetX * xOffsetFactor; 
+
+                        const wristCylinder = hand.wristCylinder;
+                        wristCylinder.position.copy(longMidPoint);
+                        // スケールは(1, 長さ, 1)で、太さはジオメトリで制御
+                        wristCylinder.scale.set(1, longDistance, 1); 
+                        wristCylinder.visible = true;
+                        
+                        // === 2. 黒いアウトラインシリンダー (短い & オフセット) ===
+                        const shortWristLength = worldScale * outlineWristLengthFactor; // 6.0 単位
+                        
+                        const startOffset = worldScale * outlineWristStartOffsetFactor; 
+
+                        // 実際のシリンダーの長さ 
+                        const actualLength = Math.max(0.01, shortWristLength - startOffset); 
+
+                        // 新しい開始点: L0から腕の方向にずらす
+                        const outlineStartPoint = v0.clone().add(handDirection.clone().multiplyScalar(startOffset));
+                        // 新しい終了点: 新しい開始点から実際の長さだけ伸ばす
+                        const shortWristEnd = outlineStartPoint.clone().add(handDirection.clone().multiplyScalar(actualLength));
+
+                        const shortDistance = shortWristEnd.distanceTo(outlineStartPoint);
+                        const shortMidPoint = new THREE.Vector3().lerpVectors(outlineStartPoint, shortWristEnd, 0.5);
+                        shortMidPoint.x += wristOffsetX * xOffsetFactor; 
+
+                        const outlineWristCylinder = hand.outlineWristCylinder;
+                        outlineWristCylinder.position.copy(shortMidPoint);
+                        // スケールは(1, 長さ, 1)で、太さはジオメトリで制御
+                        outlineWristCylinder.scale.set(1, shortDistance, 1); 
+                        outlineWristCylinder.visible = true; 
+                        
+                        // 回転はどちらのシリンダーにも適用
+                        const orientation = new THREE.Vector3().subVectors(longWristEnd, v0).normalize();
+                        const up = new THREE.Vector3(0, 1, 0); 
+
+                        wristCylinder.quaternion.setFromUnitVectors(up, orientation);
+                        outlineWristCylinder.quaternion.setFromUnitVectors(up, orientation);
+                    } else {
+                        hand.wristCylinder.visible = false;
+                        hand.outlineWristCylinder.visible = false;
+                    }
+
+                    // 5. Update the extra wrist dot (extraWristDot) - No outline for this
+                    if (v0 && v17) {
+                        // Position slightly outside (L17 side) on the L0-L17 line
+                        const wristDotPos = new THREE.Vector3().lerpVectors(v0, v17, 0.65); 
+                        
+                        hand.extraWristDot.position.copy(wristDotPos);
+                        hand.extraWristDot.scale.setScalar(extraDotThickness);
+                        hand.extraWristDot.visible = true;
+                    } else {
+                        hand.extraWristDot.visible = false;
+                    }
+                    
+                    // 6. Update palm mesh 
+                    const v1 = landmarks[1].position3D; 
+                    const v2 = landmarks[2].position3D; 
+                    const v13 = landmarks[13].position3D; 
+                    
+                    const outlinePalmMesh = hand.outlinePalmMesh;
+
+                    if (v0 && v1 && v2 && v5 && v9 && v13 && v17) {
+                        // Float32Array に修正済み
+                        const vertices_palm = new Float32Array([
+                            v0.x, v0.y, v0.z,       
+                            v1.x, v1.y, v1.z,       
+                            v2.x, v2.y, v2.z,       
+                            v5.x, v5.y, v5.z,       
+                            v9.x, v9.y, v9.z,       
+                            v13.x, v13.y, v13.z,    
+                            v17.x, v17.y, v17.z     
+                        ]);
+                        
+                        const indices = new Uint16Array([
+                            0, 1, 2, 0, 2, 3, 0, 3, 4, 0, 4, 5, 0, 5, 6, 0, 6, 1  
+                        ]);
+
+                        // --- メインメッシュの更新 ---
+                        const geometry = hand.palmMesh.geometry;
+                        let positionAttribute = geometry.getAttribute('position');
+                        
+                        if (positionAttribute && positionAttribute.count === 7) { 
+                            positionAttribute.set(vertices_palm);
+                            positionAttribute.needsUpdate = true;
+                        } else {
+                            positionAttribute = new THREE.BufferAttribute(vertices_palm, 3);
+                            geometry.setAttribute('position', positionAttribute);
+                        }
+                        
+                        if (geometry.index === null || geometry.index.count !== indices.length) {
+                            geometry.setIndex(new THREE.BufferAttribute(indices, 1));
+                        }
+                        hand.palmMesh.visible = true;
+                        
+                        // --- アウトラインメッシュの更新 ---
+                        const outlineGeometry = outlinePalmMesh.geometry;
+                        
+                        let outlinePositionAttribute = outlineGeometry.getAttribute('position');
+                        if (outlinePositionAttribute && outlinePositionAttribute.count === 7) { 
+                            outlinePositionAttribute.set(vertices_palm);
+                            outlinePositionAttribute.needsUpdate = true;
+                        } else {
+                            outlinePositionAttribute = new THREE.BufferAttribute(vertices_palm, 3);
+                            outlineGeometry.setAttribute('position', outlinePositionAttribute);
+                        }
+
+                        if (outlineGeometry.index === null || outlineGeometry.index.count !== indices.length) {
+                             outlineGeometry.setIndex(new THREE.BufferAttribute(indices, 1));
+                        }
+                        // スケールはcreateHandMeshesで設定済みのため、ここでは更新不要
+                        outlinePalmMesh.visible = true;
+                        
+                    } else {
+                        hand.palmMesh.visible = false;
+                        outlinePalmMesh.visible = false;
+
+                    }
+                    
+                    hand.isVisible = true;
+
+                } else {
+                    // Hide all elements when not detected
+                    if (hand.isVisible) {
+                        // メインボディ
+                        hand.spheres.forEach(s => s.visible = false);
+                        hand.cylinders.forEach(c => c.visible = false);
+                        hand.wristCylinder.visible = false;
+                        hand.palmMesh.visible = false;
+                        hand.extraWristDot.visible = false;
+                        
+                        // アウトライン
+                        hand.outlineSpheres.forEach(s => s.visible = false);
+                        hand.outlineCylinders.forEach(c => c.visible = false);
+                        hand.outlineWristCylinder.visible = false;
+                        hand.outlinePalmMesh.visible = false;
+                        
+                        hand.isVisible = false;
+                    }
+                }
+            }
+
+            renderer.render(scene, camera);
+        }
+        
+        // --- Main Loop ---
+        function animate() {
+            requestAnimationFrame(animate);
+            renderer.render(scene, camera);
+        }
+
+        // Start camera and tracking on window load
+        window.onload = function () {
+            resizeRenderer();
+            setupCamera();
+            animate();
+        }
+    </script>
+</body>
+</html>
